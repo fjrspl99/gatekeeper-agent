@@ -39,7 +39,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const PORT = Number(process.env.PORT || 3000);
-const HOST = "127.0.0.1";
+const HOST = "0.0.0.0";
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET || "";
 const STATE_DIR = process.env.STATE_DIR || path.join(process.cwd(), "state");
 const DEV_MODE = !SECRET;
