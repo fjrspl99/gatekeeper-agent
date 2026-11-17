@@ -8,6 +8,31 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import * as snarkjs from "snarkjs";
+import jsSha3 from "js-sha3";
+
+const { keccak_256 } = jsSha3;
+const VK = JSON.parse(fs.readFileSync(
+  path.join(path.dirname(new URL(import.meta.url).pathname), "circuit", "vk.json"), "utf8"));
+const FIELD_PRIME = BigInt(
+  "21888242871839275222246405745257275088548364400416034343698204186575808495617");
+const keccakTaskId = (id) => {
+  const r = BigInt("0x" + keccak_256(Buffer.from(String(id), "utf8"))) % FIELD_PRIME;
+  return (r < 0n ? r + FIELD_PRIME : r).toString();
+};
+// Verify a returned proof the way the platform does: groth16.verify
+// against the circuit vk + public-signal spot checks.
+async function proofChecks(taskId, json, wantDecision) {
+  if (!json?.proof || !json?.public_signals) return "no proof in response";
+  const ok = await snarkjs.groth16.verify(VK, json.public_signals, json.proof);
+  if (!ok) return "groth16.verify FAILED";
+  if (json.public_signals.length !== 13) return `expected 13 signals, got ${json.public_signals.length}`;
+  if (json.public_signals[11] !== (wantDecision === "APPROVE" ? "1" : "0"))
+    return `signals[11]=${json.public_signals[11]} != decision ${wantDecision}`;
+  if (json.public_signals[12] !== keccakTaskId(taskId))
+    return `signals[12] != keccak(task_id)`;
+  return null;
+}
 
 const SECRET = "test-secret-32-bytes-long-0123456789";
 const PORT = 3456;
@@ -130,31 +155,49 @@ try {
   ];
   for (const [name, env, wantDecision, wantCode] of cases) {
     const r = await postTask(env);
+    const proofErr = await proofChecks(env.task_id, r.json, wantDecision);
     check(`${name} (sig ok: ${r.sigOk})`,
       r.status === 200 && r.json?.decision === wantDecision && r.json?.reason_code === wantCode
-        && r.json?.proof_tx === env.input.proof_tx && r.sigOk,
-      JSON.stringify(r.json));
+        && r.json?.proof_tx === env.input.proof_tx && r.sigOk && !proofErr,
+      JSON.stringify(r.json) + (proofErr ? ` PROOF: ${proofErr}` : ""));
   }
 
-  // 11. Boundary values: balance == minimum, amount == max, block == expiry -> APPROVE
+  // 11. Boundary values: balance == minimum, amount == max -> APPROVE
+  // (block == expiry is EXPIRED per the circuit — strict, see case 11b).
   const boundary = await postTask(task("gk_07", tx(7), {
-    public_balance: "1000", amount: "1000", current_block: 19842201,
+    public_balance: "1000", amount: "1000",
   }));
-  check("boundary (balance==min, amount==max, block==expiry) -> APPROVE",
-    boundary.json?.decision === "APPROVE" && boundary.json?.reason_code === "VALID_CONDITION",
-    JSON.stringify(boundary.json));
+  const boundaryProofErr = await proofChecks("gk_07", boundary.json, "APPROVE");
+  check("boundary (balance==min, amount==max) -> APPROVE + valid proof",
+    boundary.json?.decision === "APPROVE" && boundary.json?.reason_code === "VALID_CONDITION"
+      && !boundaryProofErr,
+    JSON.stringify(boundary.json) + (boundaryProofErr ? ` PROOF: ${boundaryProofErr}` : ""));
+
+  // 11b. Expiry boundary: current_block == expiry_block -> REJECT (circuit:
+  // >= is expired). Proof must verify with decision 0.
+  const expiryEq = await postTask(task("gk_07b", tx(70), { current_block: 19842201 }));
+  const expiryProofErr = await proofChecks("gk_07b", expiryEq.json, "REJECT");
+  check("boundary (block==expiry) -> REJECT EXPIRED_CONDITION + valid proof",
+    expiryEq.json?.decision === "REJECT" && expiryEq.json?.reason_code === "EXPIRED_CONDITION"
+      && !expiryProofErr,
+    JSON.stringify(expiryEq.json) + (expiryProofErr ? ` PROOF: ${expiryProofErr}` : ""));
 
   // 12. PROOF_REUSED: tx(1) was already used by gk_01 (approved). New task, same proof_tx.
+  // No proof is attached for PROOF_REUSED.
   const reuse = await postTask(task("gk_08", tx(1)));
-  check("PROOF_REUSED (same proof_tx, new task_id) -> REJECT",
-    reuse.json?.decision === "REJECT" && reuse.json?.reason_code === "PROOF_REUSED",
+  check("PROOF_REUSED (same proof_tx, new task_id) -> REJECT, no proof",
+    reuse.json?.decision === "REJECT" && reuse.json?.reason_code === "PROOF_REUSED"
+      && !reuse.json?.proof && !reuse.json?.public_signals,
     JSON.stringify(reuse.json));
 
   // 13. Idempotency: resend gk_01 verbatim -> same APPROVE, NOT flagged as reuse.
+  // Same stored proof is returned (identical proof object).
   const replay = await postTask(task("gk_01", tx(1)));
-  check("idempotent replay of gk_01 -> same APPROVE (not PROOF_REUSED)",
-    replay.json?.decision === "APPROVE" && replay.json?.reason_code === "VALID_CONDITION",
-    JSON.stringify(replay.json));
+  const replayProofErr = await proofChecks("gk_01", replay.json, "APPROVE");
+  check("idempotent replay of gk_01 -> same APPROVE (not PROOF_REUSED), same proof",
+    replay.json?.decision === "APPROVE" && replay.json?.reason_code === "VALID_CONDITION"
+      && !replayProofErr,
+    JSON.stringify(replay.json) + (replayProofErr ? ` PROOF: ${replayProofErr}` : ""));
 
   // 14. Malformed input fails closed.
   const malformed = await postTask({

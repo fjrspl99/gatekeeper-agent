@@ -1,9 +1,12 @@
-# Proof Gatekeeper agent — DECISION-ONLY
+# Proof Gatekeeper agent — WITH Groth16 proofs
 
 Deterministic HTTP agent for the zkVerify Agent Games **Proof Gatekeeper**
 track. It receives signed task envelopes, runs the 7 documented checks,
-and returns a signed APPROVE/REJECT decision. No LLM/model call is in the
-decision path.
+generates a Groth16 proof for each decision with snarkjs (circuit
+artifacts in `./circuit`, mapping verified locally 2026-11-17 — see
+`~/workspace/zkverify/circuit/MAPPING.md`), optionally submits the proof
+to Kurier for on-chain confirmation, and returns a signed
+APPROVE/REJECT decision + proof. No LLM/model call is in the decision path.
 
 ## Run
 
@@ -23,6 +26,9 @@ node server.mjs
 | Var | Required | Notes |
 |---|---|---|
 | `AGENT_GAMES_HMAC_SECRET` | yes, for production | 32-byte secret generated at endpoint registration (dashboard, shown once). If unset, the server runs in **UNSAFE dev mode**: HMAC verification is disabled and responses are unsigned. Never register an endpoint in dev mode. |
+| `KURIER_API_KEY` | no | Free key from kurier.xyz — enables on-chain confirmation. Without it the agent still answers with a valid in-response proof, but scored rounds may not count it as verified (see Scoring). |
+| `KURIER_API_URL` | no | default https://api.kurier.xyz/api/v1 |
+| `KURIER_POLL_BUDGET_MS` | no | default 40000 — bounded so the answer stays inside the 60 s task window |
 | `PORT` | no | default 3000 |
 | `STATE_DIR` | no | default `./state` |
 
@@ -33,36 +39,46 @@ node server.mjs
 | 1 | `proof_vk == registered_vk` (case-insensitive) | `VK_SUBSTITUTION` |
 | 2 | `public_balance >= minimum` (BigInt) | `THRESHOLD_MISMATCH` |
 | 3 | `proof_tx` not in seen-set | `PROOF_REUSED` |
-| 4 | `current_block <= expiry_block` | `EXPIRED_CONDITION` |
+| 4 | `current_block < expiry_block` (STRICT: == is expired, circuit-verified) | `EXPIRED_CONDITION` |
 | 5 | `recipient == condition_recipient` (case-insensitive) | `RECIPIENT_MISMATCH` |
 | 6 | `amount <= max_transfer` (BigInt) | `AMOUNT_OVERFLOW` |
 | 7 | all pass | `APPROVE` / `VALID_CONDITION` |
 
 Malformed input or any error → `REJECT` / `INVALID_TASK` (fail closed).
-Boundary values are inclusive: balance == minimum, amount == max_transfer,
-and block == expiry all APPROVE.
+Boundary values are inclusive, except expiry: balance == minimum and
+amount == max_transfer APPROVE, but block == expiry REJECTS (the circuit
+treats current_block >= expiry_block as expired — verified 2026-11-17).
 
 State: `state/seen.json` (every `proof_tx` processed) and
 `state/decisions.json` (`task_id` → response, for idempotent retries).
 Both persist across restarts — a seen-set that resets would approve a
 reused proof.
 
-## Scoring (decision-only)
+## Scoring (with Groth16 proofs)
 
-A correct decision without a valid Groth16 proof scores **+10/task**
-(+12 minus the −2 missing-proof penalty, no reliability bonus) instead of
-+12 + bonus. Wrong decisions cost the same either way (−6 wrong approve,
-−3 wrong reject). See `~/workspace/zkverify/NOTES.md` §3.
+A correct decision with a valid Groth16 proof scores **+12/task** plus
+the reliability bonus (verified proofs / tasks), instead of +10
+decision-only (+12 minus the −2 missing-proof penalty, no bonus).
+Wrong decisions cost the same either way (−6 wrong approve, −3 wrong
+reject). In scored rounds the platform counts a proof as verified only
+when it is CONFIRMED ON-CHAIN — see Kurier below. See
+`~/workspace/zkverify/NOTES.md` §3.
 
-## NOT implemented yet — Groth16 proof
+## Groth16 proof — IMPLEMENTED 2026-11-17
 
-Proof generation is **blocked**: the guide publishes the circuit wasm/zkey
-and `vk_hash`, but NOT the circuit's input signal names/values or the
-public-signal order (gatekeeper nPublic = 13). To resolve: zkVerify
-Discord, the agent dashboard after registration, or practice mode. Once
-the inputs are known, add snarkjs proof generation + Kurier submit and
-validate in practice mode before a scored round. Do **not** submit a
-decision-only agent to a scored round expecting the reliability bonus.
+Circuit input mapping reverse-engineered from community sources and
+verified locally with snarkjs (see `~/workspace/zkverify/circuit/MAPPING.md`):
+13 inputs, taskId = keccak256(task_id) mod p, fresh random salt per proof,
+decision 1/0. `node test.mjs` verifies every returned proof with
+`groth16.verify` against the circuit vk (17/17 PASS, proof gen ~0.3–0.9 s).
+
+Kurier (on-chain confirmation): when `KURIER_API_KEY` is set, each proof
+is submitted to Kurier and polled until Finalized (bounded 40 s budget);
+the response's `proof_tx` then carries the Kurier tx hash. Evidence from
+andruu's Round 3 (0/8 proofs counted with in-response proofs only) says
+this step is what makes proofs count in scored rounds. **Kurier key still
+missing — free signup at kurier.xyz.** Without it the agent answers with
+valid in-response proofs only.
 
 ## Assumptions to confirm in practice mode
 
